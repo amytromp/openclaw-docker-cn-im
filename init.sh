@@ -272,6 +272,36 @@ def resolve_image_model(env, default_model_id, provider_names=None):
     return normalize_model_ref(default_model_id, provider_names=provider_names)
 
 
+def collect_extra_model_providers(env, start=2, end=6):
+    providers = []
+    for index in range(start, end + 1):
+        prefix = f'MODEL{index}'
+        raw_name = str(env.get(f'{prefix}_NAME') or '').strip()
+        provider_name = raw_name or f'model{index}'
+        model_ids = str(env.get(f'{prefix}_MODEL_ID') or '').strip()
+        base_url = str(env.get(f'{prefix}_BASE_URL') or '').strip()
+        api_key = str(env.get(f'{prefix}_API_KEY') or '').strip()
+        protocol = str(env.get(f'{prefix}_PROTOCOL') or '').strip()
+        context_window = str(env.get(f'{prefix}_CONTEXT_WINDOW') or '').strip()
+        max_tokens = str(env.get(f'{prefix}_MAX_TOKENS') or '').strip()
+
+        has_any = any([raw_name, model_ids, base_url, api_key, protocol, context_window, max_tokens])
+        if not has_any:
+            continue
+
+        providers.append({
+            'index': index,
+            'provider_name': provider_name,
+            'model_ids': model_ids,
+            'base_url': base_url,
+            'api_key': api_key,
+            'protocol': protocol,
+            'context_window': context_window,
+            'max_tokens': max_tokens,
+        })
+    return providers
+
+
 def is_valid_account_id(account_id):
     return WECOM_ACCOUNT_ID_RE.match(str(account_id)) is not None
 
@@ -392,7 +422,7 @@ def normalize_qqbot_config(channels):
         migrated = migrated or qqbot.get('accounts') != accounts
 
     if migrated:
-        print('✅ QQ 机器人配置已标准化为多 Bot 结构（旧单账号已兼容为 default）')
+        print('✅ QQ 机器人配置已标准化为多 Bot 结构')
 
 
 def migrate_feishu_config(channels_root):
@@ -686,16 +716,19 @@ def sync_models(ctx):
         ctx.env.get('MAX_TOKENS'),
     )
 
-    fallback_provider_name = ctx.env.get('MODEL2_NAME') or 'model2'
-    fallback_provider = sync_provider(
-        fallback_provider_name,
-        ctx.env.get('MODEL2_API_KEY'),
-        ctx.env.get('MODEL2_BASE_URL'),
-        ctx.env.get('MODEL2_PROTOCOL'),
-        ctx.env.get('MODEL2_MODEL_ID') or '',
-        ctx.env.get('MODEL2_CONTEXT_WINDOW'),
-        ctx.env.get('MODEL2_MAX_TOKENS'),
-    )
+    enabled_extra_providers = []
+    for provider_cfg in collect_extra_model_providers(ctx.env):
+        synced_name = sync_provider(
+            provider_cfg['provider_name'],
+            provider_cfg['api_key'],
+            provider_cfg['base_url'],
+            provider_cfg['protocol'],
+            provider_cfg['model_ids'],
+            provider_cfg['context_window'],
+            provider_cfg['max_tokens'],
+        )
+        if synced_name:
+            enabled_extra_providers.append(synced_name)
 
     # 提取默认模型 ID (MODEL_ID 的第一个)
     default_model_id = first_csv_item(ctx.env.get('MODEL_ID') or 'gpt-4o', 'gpt-4o')
@@ -724,8 +757,8 @@ def sync_models(ctx):
     if primary_model_raw:
         msg += f' (来自 PRIMARY_MODEL={primary_model_raw})'
     msg += f', 图片模型={primary_image_model}'
-    if fallback_provider:
-        msg += f', 已启用备用提供商: {fallback_provider_name}'
+    if enabled_extra_providers:
+        msg += f", 已启用额外提供商: {', '.join(enabled_extra_providers)}"
     print(msg)
 
 
@@ -1106,8 +1139,51 @@ normalize_sync_check() {
     echo "$sync_check"
 }
 
+collect_provider_names() {
+    local names=("default")
+    local i
+    for i in 2 3 4 5 6; do
+        local name_var="MODEL${i}_NAME"
+        local provider_name="${!name_var}"
+        if [ -n "$provider_name" ]; then
+            names+=("$provider_name")
+        else
+            names+=("model${i}")
+        fi
+    done
+    echo "${names[@]}"
+}
+
+normalize_model_ref_shell() {
+    local raw="$1"
+    shift
+    local provider_prefix known
+    local known_providers=("$@")
+
+    if [ -z "$raw" ]; then
+        echo ""
+        return
+    fi
+
+    if [[ "$raw" != */* ]]; then
+        echo "default/$raw"
+        return
+    fi
+
+    provider_prefix="${raw%%/*}"
+    for known in "${known_providers[@]}"; do
+        if [ "$provider_prefix" = "$known" ]; then
+            echo "$raw"
+            return
+        fi
+    done
+
+    echo "default/$raw"
+}
+
 print_model_summary() {
     local sync_check final_mid final_imid
+    local provider_names extra_providers i api_key_var provider_name_var provider_name
     sync_check="$(normalize_sync_check)"
 
     if [ "$sync_check" = "false" ] || [ "$sync_check" = "0" ] || [ "$sync_check" = "no" ]; then
@@ -1115,29 +1191,33 @@ print_model_summary() {
         return
     fi
 
+    read -r -a provider_names <<< "$(collect_provider_names)"
+
     final_mid="${PRIMARY_MODEL:-${MODEL_ID:-gpt-4o}}"
-    if [[ "$final_mid" != */* ]]; then
-        final_mid="default/$final_mid"
-    else
-        local provider_prefix="${final_mid%%/*}"
-        if [[ "$provider_prefix" != "default" && "$provider_prefix" != "model2" ]]; then
-            final_mid="default/$final_mid"
-        fi
-    fi
+    final_mid="$(normalize_model_ref_shell "$final_mid" "${provider_names[@]}")"
 
     final_imid="${IMAGE_MODEL_ID:-${MODEL_ID:-gpt-4o}}"
-    if [[ "$final_imid" != */* ]]; then
-        final_imid="default/$final_imid"
-    else
-        local provider_prefix="${final_imid%%/*}"
-        if [[ "$provider_prefix" != "default" && "$provider_prefix" != "model2" ]]; then
-            final_imid="default/$final_imid"
-        fi
-    fi
+    final_imid="$(normalize_model_ref_shell "$final_imid" "${provider_names[@]}")"
 
     echo "当前主模型: $final_mid"
     echo "当前图片模型: $final_imid"
-    [ -n "$MODEL2_API_KEY" ] && echo "备用提供商: ${MODEL2_NAME:-model2} (已启用)"
+
+    extra_providers=()
+    for i in 2 3 4 5 6; do
+        api_key_var="MODEL${i}_API_KEY"
+        provider_name_var="MODEL${i}_NAME"
+        if [ -n "${!api_key_var}" ] || [ -n "${!provider_name_var}" ]; then
+            provider_name="${!provider_name_var}"
+            if [ -z "$provider_name" ]; then
+                provider_name="model${i}"
+            fi
+            extra_providers+=("$provider_name")
+        fi
+    done
+
+    if [ ${#extra_providers[@]} -gt 0 ]; then
+        echo "额外提供商: ${extra_providers[*]}"
+    fi
 }
 
 print_runtime_summary() {
