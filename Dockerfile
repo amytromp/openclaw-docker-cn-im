@@ -31,6 +31,8 @@ RUN apt-get update && \
     socat \
     tini \
     unzip \
+    vim \
+    python3-pip \
     websockify && \
     sed -i 's/^# *en_US.UTF-8 UTF-8$/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
     locale-gen && \
